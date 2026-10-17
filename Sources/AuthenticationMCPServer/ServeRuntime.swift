@@ -71,15 +71,14 @@ enum ServeRuntime {
                     ?? 3600),
             allowedOrigins: EnvironmentConfiguration.list("AUTH_MCP_ALLOWED_ORIGINS") ?? [])
 
-        if configuration.host != "127.0.0.1" && configuration.host != "localhost"
-            && configuration.allowedOrigins.isEmpty
-        {
+        if configuration.hostAllowlist == nil {
             logger.warning(
                 """
-                Binding a non-loopback interface with no AUTH_MCP_ALLOWED_ORIGINS set. \
-                Origin checking is disabled, so anything that can reach this port can \
-                drive the server. Set AUTH_MCP_ALLOWED_ORIGINS, or front it with a proxy \
-                that validates Origin.
+                Bound to every interface with no AUTH_MCP_ALLOWED_ORIGINS set, so the \
+                Host/Origin check is disabled: any name that resolves to this machine is \
+                accepted, which leaves browsers open to DNS rebinding. Set \
+                AUTH_MCP_ALLOWED_ORIGINS to the name clients connect with (for example \
+                192.168.1.20:8080 or mymac.local:8080), or bind one address with --host.
                 """,
                 metadata: ["host": .string(configuration.host)])
         }

@@ -29,6 +29,12 @@ public actor MCPHTTPHost {
         /// SSE reconnection hint, in milliseconds.
         public var retryInterval: Int?
 
+        /// The `Host`/`Origin` values the endpoint accepts, or `nil` when the
+        /// check is disabled (a wildcard bind with nothing configured).
+        public var hostAllowlist: HostAllowlist? {
+            HostAllowlist.make(entries: allowedOrigins, bindHost: host, port: port)
+        }
+
         public init(
             host: String = "127.0.0.1",
             port: Int = 8080,
@@ -98,7 +104,12 @@ public actor MCPHTTPHost {
             "MCP HTTP endpoint listening",
             metadata: [
                 "url": .string(
-                    "http://\(configuration.host):\(configuration.port)\(configuration.endpoint)")
+                    "http://\(configuration.host):\(configuration.port)\(configuration.endpoint)"),
+                // The first thing to check when a client gets a 421: is the name
+                // it connects with on this list?
+                "accepted_hosts": .string(
+                    configuration.hostAllowlist?.hosts.joined(separator: " ")
+                        ?? "ANY (host check disabled)"),
             ])
 
         maintenanceTask = Task { [weak self] in
@@ -270,14 +281,11 @@ public actor MCPHTTPHost {
     /// server with the user's own credentials.
     private func makeValidationPipeline() -> any HTTPRequestValidationPipeline {
         let originValidator: OriginValidator
-        if configuration.allowedOrigins.isEmpty {
-            originValidator = isLoopbackBinding
-                ? OriginValidator.localhost(port: configuration.port)
-                : OriginValidator.disabled
-        } else {
+        if let allowlist = configuration.hostAllowlist {
             originValidator = OriginValidator(
-                allowedHosts: configuration.allowedOrigins,
-                allowedOrigins: configuration.allowedOrigins)
+                allowedHosts: allowlist.hosts, allowedOrigins: allowlist.origins)
+        } else {
+            originValidator = .disabled
         }
 
         return StandardValidationPipeline(validators: [
@@ -289,9 +297,6 @@ public actor MCPHTTPHost {
         ])
     }
 
-    private var isLoopbackBinding: Bool {
-        ["127.0.0.1", "localhost", "::1"].contains(configuration.host)
-    }
 
     /// Open HTTP session count, for tests and metrics.
     public var openSessionCount: Int { sessions.count }

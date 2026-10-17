@@ -22,6 +22,10 @@ transports (stdio and Streamable HTTP) from one core.
 lifecycle, both OAuth grants, the credential store split, sign-in/out — as diagrams
 that render right here on GitHub.
 
+🌐 **[LOCAL_NETWORK.md](LOCAL_NETWORK.md)** walks through hosting the server on one
+machine and using it from Claude Code, Codex, Claude Desktop or the MCP Inspector
+on other devices on your network.
+
 ## Quick start
 
 ```bash
@@ -245,7 +249,7 @@ Endpoint overrides for providers with incomplete metadata:
 | --- | --- | --- |
 | `AUTH_MCP_TRANSPORT` | `stdio` | `stdio` or `http` |
 | `AUTH_MCP_HTTP_HOST` / `_PORT` / `_ENDPOINT` | `127.0.0.1` / `8080` / `/mcp` | HTTP binding |
-| `AUTH_MCP_ALLOWED_ORIGINS` | *(loopback only)* | Comma-separated `Origin` allowlist |
+| `AUTH_MCP_ALLOWED_ORIGINS` | loopback + the `--host` address | Extra names clients may connect with, as `host:port` or a URL — checked against both `Host` and `Origin` |
 | `AUTH_MCP_STORE` | `memory` | Record store: `memory` or `file` |
 | `AUTH_MCP_STORE_PATH` | `./.authentication-service/records` | Directory for the file store |
 | `AUTH_MCP_LOG_LEVEL` | `info` | Logs always go to stderr |
@@ -272,7 +276,8 @@ Endpoint overrides for providers with incomplete metadata:
 
 Run `auth login` once in a terminal with the same environment, and the server
 picks the credential up. Over HTTP, point the client at
-`http://127.0.0.1:8080/mcp`; `GET /healthz` answers `{"status":"ok"}`.
+`http://127.0.0.1:8080/mcp`; `GET /healthz` answers `{"status":"ok"}`. To serve
+other devices on your network, see [LOCAL_NETWORK.md](LOCAL_NETWORK.md).
 
 ## Swapping the data store
 
@@ -303,9 +308,11 @@ Sources/
     Server/                 Tool catalog, argument validation, error mapping
     Security/               Scopes, rate limiting, audit log, redaction
     Support/                JSON Schema DSL, Value helpers, timestamps
-  AuthenticationHTTP/       NIO host for Streamable HTTP
+  AuthenticationHTTP/       NIO host for Streamable HTTP, Host/Origin allowlist
   AuthenticationMCPServer/  Executable: serve + auth subcommands
-Tests/AuthenticationKitTests/
+Tests/
+  AuthenticationKitTests/   Unit and end-to-end tests over InMemoryTransport
+  AuthenticationHTTPTests/  The allowlist, checked against the SDK's own validator
 ```
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for what each of these actually does, with
@@ -313,9 +320,12 @@ diagrams for the request lifecycle, both OAuth grants, and the credential store.
 
 ## Security notes
 
-- **Origin checking.** A localhost-bound HTTP server validates `Origin` against
-  loopback, defending against DNS rebinding. Binding a non-loopback interface with
-  no `AUTH_MCP_ALLOWED_ORIGINS` disables the check and logs a warning.
+- **Host and Origin checking.** The HTTP endpoint accepts only requests addressed
+  to a name it expects — loopback, the address passed to `--host`, and anything in
+  `AUTH_MCP_ALLOWED_ORIGINS` — which defends against DNS rebinding. Only binding
+  every interface (`--host 0.0.0.0`) with nothing configured switches the check
+  off, and the server warns when it does. The plain-HTTP endpoint is not
+  encrypted; see [LOCAL_NETWORK.md](LOCAL_NETWORK.md#security-on-a-shared-network).
 - **PKCE is mandatory** for the authorization code grant, per OAuth 2.1.
 - **ID tokens are parsed without signature verification**, which OpenID Connect
   Core §3.1.3.7 permits only because they arrive directly from the token endpoint

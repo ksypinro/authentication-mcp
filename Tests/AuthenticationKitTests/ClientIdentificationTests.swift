@@ -54,6 +54,34 @@ struct ClientIdentificationTests {
         await connection.server.stop()
     }
 
+    // MARK: - advertised capabilities
+
+    @Test("The server advertises only capabilities it implements")
+    func advertisesOnlyImplementedCapabilities() async throws {
+        // Advertising `logging` without a `logging/setLevel` handler made the MCP
+        // Inspector abort right after `initialize`. Only `tools` is real.
+        let (service, _, _, auditLog) = makeTestService()
+        let owner = SessionOwner("capabilities")
+        let identity = ConnectedClientIdentity()
+        let server = await AuthenticationMCPServer.make(
+            service: service, owner: owner, clientIdentity: identity, logger: makeSilentLogger())
+        let (clientTransport, serverTransport) = await InMemoryTransport.createConnectedPair()
+        try await server.start(
+            transport: serverTransport,
+            initializeHook: AuthenticationMCPServer.clientIdentificationHook(
+                owner: owner, clientIdentity: identity, auditLog: auditLog,
+                logger: makeSilentLogger()))
+
+        let client = Client(name: "capability-check", version: "1.0.0")
+        let result = try await client.connect(transport: clientTransport)
+        defer { Task { await client.disconnect(); await server.stop() } }
+
+        #expect(result.capabilities.tools != nil)
+        #expect(result.capabilities.logging == nil)
+        #expect(result.capabilities.resources == nil)
+        #expect(result.capabilities.prompts == nil)
+    }
+
     // MARK: - initialize handshake → audit log
 
     @Test("A real initialize handshake records the client's name and version")

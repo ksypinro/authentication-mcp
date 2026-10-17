@@ -360,6 +360,13 @@ public actor OAuthAuthorizationProvider: AuthorizationProvider {
             if waitUntil > now() {
                 if waitUntil > deadline {
                     persist(handle: handle, flow: currentFlow)
+                    // Hold the call until the caller's deadline before reporting
+                    // `pending`, as `wait_seconds` promises. Returning at once
+                    // whenever the next poll falls after the deadline turned a
+                    // client asking to wait 2s against a 5s interval into a busy
+                    // loop of instant replies.
+                    let remaining = deadline.timeIntervalSince(now())
+                    if remaining > 0 { try await Task.sleep(for: .seconds(remaining)) }
                     return .pending(currentFlow.interaction)
                 }
                 try await Task.sleep(for: .seconds(waitUntil.timeIntervalSince(now())))

@@ -21,6 +21,52 @@ public enum ToolCatalog {
         [authenticate, revokeAuthentication, fetchData, updatedData]
     }
 
+    // MARK: - Result shape
+
+    /// The output schema for a tool: its success shape, or the shared failure shape.
+    ///
+    /// Every result carries `ok`, and a failed call (`isError: true`) carries an
+    /// `error` object instead of the tool's own fields. Both shapes must be in the
+    /// schema: the MCP spec requires structured content to conform to the declared
+    /// `outputSchema`, and clients built on the TypeScript SDK (the MCP Inspector,
+    /// among others) validate every result against it and reject one that doesn't
+    /// match. Before this, `ok` was undeclared under `additionalProperties: false`,
+    /// so every successful call failed validation in those clients.
+    ///
+    /// The top level stays `type: "object"` because clients require it there.
+    static func resultSchema(properties: [String: Value], required: [String]) -> Value {
+        var successProperties = properties
+        successProperties["ok"] = JSONSchema.constant(.bool(true), "The call succeeded.")
+        let success = JSONSchema.object(
+            properties: successProperties, required: ["ok"] + required)
+        return .object([
+            "type": .string("object"),
+            "anyOf": .array([success, failureSchema]),
+        ])
+    }
+
+    /// The shape of `structuredContent` when a call fails, shared by all four tools.
+    static let failureSchema: Value = JSONSchema.object(
+        description: "Returned with `isError: true` when the call failed.",
+        properties: [
+            "ok": JSONSchema.constant(.bool(false), "The call failed."),
+            "error": JSONSchema.object(
+                properties: [
+                    "code": JSONSchema.string(
+                        "A stable, machine-readable error code.",
+                        enumValues: ToolErrorCode.allCases.map(\.rawValue)),
+                    "message": JSONSchema.string("What went wrong."),
+                    "remediation": JSONSchema.string("What to do next."),
+                    "retryable": JSONSchema.boolean(
+                        "Whether retrying the same call unchanged could succeed."),
+                ],
+                required: ["code", "message", "retryable"],
+                // Each code adds its own details — `current_version`,
+                // `retry_after_seconds`, `required_scope` and so on.
+                additionalProperties: true),
+        ],
+        required: ["ok", "error"])
+
     // MARK: - authenticate
 
     public static let authenticate = Tool(
@@ -87,7 +133,7 @@ public enum ToolCatalog {
             destructiveHint: false,
             idempotentHint: true,
             openWorldHint: true),
-        outputSchema: JSONSchema.object(
+        outputSchema: resultSchema(
             properties: [
                 "status": JSONSchema.string(
                     """
@@ -125,6 +171,8 @@ public enum ToolCatalog {
                 "expires_at": JSONSchema.timestamp("When the pending request stops being accepted."),
                 "instructions": JSONSchema.string("A sentence to relay to the user."),
                 "reason": JSONSchema.string("Why sign-in was denied, when status is 'denied'."),
+                "scope_warning": JSONSchema.string(
+                    "Present when the provider granted fewer scopes than requested."),
             ],
             required: ["status"]))
 
@@ -160,7 +208,7 @@ public enum ToolCatalog {
             destructiveHint: true,
             idempotentHint: true,
             openWorldHint: true),
-        outputSchema: JSONSchema.object(
+        outputSchema: resultSchema(
             properties: [
                 "revoked_session_ids": JSONSchema.array(
                     "The sessions that were destroyed. Empty if there was nothing to revoke.",
@@ -178,6 +226,12 @@ public enum ToolCatalog {
                     until they expire.
                     """),
                 "warning": JSONSchema.string("Why the upstream revocation did not complete."),
+                "revoked_accounts": JSONSchema.array(
+                    """
+                    Stored credentials that were signed out when no live session existed \
+                    — a sign-in made earlier with `auth login`.
+                    """,
+                    items: JSONSchema.string("An account name.")),
             ],
             required: ["revoked_session_ids", "upstream_complete"]))
 
@@ -214,7 +268,7 @@ public enum ToolCatalog {
             destructiveHint: false,
             idempotentHint: true,
             openWorldHint: false),
-        outputSchema: JSONSchema.object(
+        outputSchema: resultSchema(
             properties: [
                 "id": JSONSchema.string("The record identifier."),
                 "value": JSONSchema.freeformObject("The stored JSON value."),
@@ -282,7 +336,7 @@ public enum ToolCatalog {
             destructiveHint: true,
             idempotentHint: false,
             openWorldHint: false),
-        outputSchema: JSONSchema.object(
+        outputSchema: resultSchema(
             properties: [
                 "id": JSONSchema.string("The record identifier."),
                 "version": JSONSchema.integer("The version after this write."),

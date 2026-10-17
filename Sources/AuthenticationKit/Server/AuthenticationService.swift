@@ -108,7 +108,8 @@ public actor AuthenticationService {
         owner: SessionOwner
     ) async throws -> CallTool.Result {
         try arguments.rejectUnknownParameters(allowed: Self.authenticateParameters)
-        try await enforceRateLimit(owner: owner, limit: .authentication, tool: "authenticate")
+
+        try await enforceRateLimit(owner: owner, limit: .poll, tool: "authenticate.check")
 
         let requestedScopes = try arguments.optionalStringArray("scopes")
             .map { Set($0.map(Scope.init)) } ?? defaultScopes
@@ -155,6 +156,14 @@ public actor AuthenticationService {
                 await provider.cancelAuthorization(handle: stale)
                 await sessionStore.clearPendingHandle(for: owner)
             }
+            // Only starting a flow is rate-limited: it is the call that reaches the
+            // authorization server's device or authorize endpoint and creates new
+            // pending state. Resuming a flow with its `flow_id` is not charged —
+            // the provider already paces its token-endpoint polls to the server's
+            // `interval` and `slow_down`, and over HTTP the device grant is the only
+            // way to sign in, so a client polling every few seconds while a person
+            // types a code on their phone is the normal case, not abuse.
+            try await enforceRateLimit(owner: owner, limit: .authentication, tool: "authenticate")
             let start = try await provider.beginAuthorization(scopes: requestedScopes, mode: mode)
             await sessionStore.recordPendingHandle(start.handle, for: owner)
             await auditLog.record(

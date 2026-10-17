@@ -5,7 +5,7 @@ import MCP
 ///
 /// Models recover far better from a stable code plus a concrete next step than
 /// from prose alone, so every failure carries both.
-public enum ToolErrorCode: String, Sendable, Codable {
+public enum ToolErrorCode: String, Sendable, Codable, CaseIterable {
     case invalidInput = "invalid_input"
     case notAuthenticated = "not_authenticated"
     case sessionNotFound = "session_not_found"

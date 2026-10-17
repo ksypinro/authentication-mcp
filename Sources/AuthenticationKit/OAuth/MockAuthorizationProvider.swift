@@ -155,6 +155,16 @@ public actor MockAuthorizationProvider: AuthorizationProvider {
                     }
                 }
             }
+            // Honour the caller's wait the way a real server's poll does, so a
+            // client is paced by `wait_seconds` rather than spinning on instant
+            // `pending` replies — and pick up a manual approval made meanwhile.
+            if timeout > 0 {
+                try await Task.sleep(for: .seconds(timeout))
+                if let current = flows[handle], current.decision == .approved {
+                    flows.removeValue(forKey: handle)
+                    return .completed(issueTokens(scopes: current.scopes))
+                }
+            }
             return .pending(flow.interaction)
         }
     }

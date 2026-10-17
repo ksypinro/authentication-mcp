@@ -22,6 +22,11 @@ public actor RateLimiter {
 
         /// Authorization is expensive and user-interactive: allow a small burst.
         public static let authentication = Limit(capacity: 5, refillPerSecond: 0.2)
+        /// Checking on a sign-in — an existing session, or a pending flow by its
+        /// `flow_id` — is cheap and paced by `wait_seconds`, so this only exists
+        /// to stop a genuine spin loop. A client polling every second for the
+        /// full five-minute device-code window never comes near it.
+        public static let poll = Limit(capacity: 30, refillPerSecond: 2)
         /// Reads are cheap.
         public static let read = Limit(capacity: 60, refillPerSecond: 10)
         /// Writes are persisted and audited.

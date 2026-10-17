@@ -6,7 +6,8 @@ but not a `logout`. Each diagram is Mermaid, so it renders directly on this
 page; nothing here is a static image to go stale next to the code.
 
 If you haven't read it yet, [`README.md`](README.md) covers what the project
-does and how to configure it. This document covers *why it's built the way it
+does and how to configure it, and [`LOCAL_NETWORK.md`](LOCAL_NETWORK.md) covers
+serving it to other devices. This document covers *why it's built the way it
 is*.
 
 ## Contents
@@ -356,9 +357,11 @@ Sources/
     Server/                   Tool catalog, argument validation, error mapping, client identity
     Security/                 Scopes, rate limiting, audit log, redaction
     Support/                  JSON Schema DSL, Value helpers, timestamps, ClientContext
-  AuthenticationHTTP/         NIO host for Streamable HTTP
+  AuthenticationHTTP/         NIO host for Streamable HTTP, Host/Origin allowlist
   AuthenticationMCPServer/    Executable: serve + auth subcommands
-Tests/AuthenticationKitTests/ 128 tests — unit, and end-to-end over InMemoryTransport
+Tests/
+  AuthenticationKitTests/     Unit, and end-to-end over InMemoryTransport; output-schema conformance
+  AuthenticationHTTPTests/    HostAllowlist, checked against the SDK's own OriginValidator
 ```
 
 Every collaborator in the diagrams above is a real type in this tree, not a
