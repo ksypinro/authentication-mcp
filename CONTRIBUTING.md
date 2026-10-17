@@ -74,6 +74,14 @@ short version:
   [`ToolResult.swift`](Sources/AuthenticationKit/Server/ToolResult.swift) is
   the single place that maps every internal error type onto a stable code and
   a remediation string — extend it there, don't throw a new error type past it.
+- **Every field a tool returns is in its `outputSchema`, and every capability
+  advertised is implemented.** Clients built on the TypeScript SDK validate each
+  result against the declared schema and reject one that doesn't match; some call
+  every advertised capability right after connecting. `ToolCatalog.resultSchema`
+  covers the shared `ok`/`error` fields;
+  [`OutputSchemaConformanceTests.swift`](Tests/AuthenticationKitTests/OutputSchemaConformanceTests.swift)
+  runs each tool's real results through its own schema — add a case there when a
+  tool gains a new result shape.
 - **Token material never leaves `Credentials/` or `OAuth/`.** If you find
   yourself passing an access or refresh token string into `Server/` or across
   a tool boundary, that's a sign the design needs another look, not a reason

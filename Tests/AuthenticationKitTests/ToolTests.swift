@@ -125,6 +125,89 @@ struct ToolTests {
         #expect(completed.sessionID != nil)
     }
 
+    @Test("Polling a pending sign-in is never rate limited")
+    func pollingIsNotRateLimited() async throws {
+        // Over HTTP the device grant is the only way to sign in, and a person can
+        // take a minute to type the code. A client polling every few seconds must
+        // not exhaust the budget meant for starting flows (burst of 5).
+        let (service, _, _, _) = makeTestService(policy: .manual)
+        let first = try await service.call(
+            name: "authenticate", arguments: ["wait_seconds": .int(0)], owner: owner)
+        let flowID = try #require(first.structured["flow_id"]?.stringValue)
+
+        for _ in 0..<20 {
+            let poll = try await service.call(
+                name: "authenticate",
+                arguments: ["flow_id": .string(flowID), "wait_seconds": .int(0)],
+                owner: owner)
+            #expect(poll.errorCode != "rate_limited")
+            #expect(poll.structured["status"]?.stringValue == "pending")
+        }
+    }
+
+    @Test("A pending poll waits out wait_seconds, and sees an approval made meanwhile")
+    func pendingPollWaitsAndPicksUpApproval() async throws {
+        let (service, provider, _, _) = makeTestService(policy: .manual)
+        let first = try await service.call(
+            name: "authenticate", arguments: ["wait_seconds": .int(0)], owner: owner)
+        let flowID = try #require(first.structured["flow_id"]?.stringValue)
+        let userCode = try #require(first.structured["user_code"]?.stringValue)
+
+        // Still pending: the call is held for the full wait, not answered at once.
+        let clock = ContinuousClock()
+        var began = clock.now
+        let pending = try await service.call(
+            name: "authenticate",
+            arguments: ["flow_id": .string(flowID), "wait_seconds": .int(1)],
+            owner: owner)
+        #expect(pending.structured["status"]?.stringValue == "pending")
+        #expect(clock.now - began >= .milliseconds(900))
+
+        // The user approves while a poll is waiting: that same poll completes.
+        let approver = Task {
+            try await Task.sleep(for: .milliseconds(300))
+            await provider.approve(userCode: userCode)
+        }
+        began = clock.now
+        let done = try await service.call(
+            name: "authenticate",
+            arguments: ["flow_id": .string(flowID), "wait_seconds": .int(2)],
+            owner: owner)
+        _ = try await approver.value
+        #expect(done.structured["status"]?.stringValue == "authenticated")
+    }
+
+    @Test("A genuine spin loop on authenticate is still stopped")
+    func spinLoopIsStopped() async throws {
+        // Polls are exempt from the strict new-flow budget, not from all limits:
+        // wait_seconds 0 in a tight loop must eventually be told to back off.
+        let (service, _, _, _) = makeTestService(policy: .manual)
+        let first = try await service.call(
+            name: "authenticate", arguments: ["wait_seconds": .int(0)], owner: owner)
+        let flowID = try #require(first.structured["flow_id"]?.stringValue)
+
+        var limited = false
+        for _ in 0..<100 where !limited {
+            let poll = try await service.call(
+                name: "authenticate",
+                arguments: ["flow_id": .string(flowID), "wait_seconds": .int(0)],
+                owner: owner)
+            limited = poll.errorCode == "rate_limited"
+        }
+        #expect(limited)
+    }
+
+    @Test("An already signed-in check is not charged against the budget either")
+    func sessionReuseIsNotRateLimited() async throws {
+        let (service, _, _, _) = makeTestService()
+        _ = try await service.call(name: "authenticate", arguments: [:], owner: owner)
+
+        for _ in 0..<20 {
+            let again = try await service.call(name: "authenticate", arguments: [:], owner: owner)
+            #expect(again.structured["status"]?.stringValue == "authenticated")
+        }
+    }
+
     @Test("Calling authenticate again resumes the pending flow instead of restarting it")
     func resumesPendingFlow() async throws {
         let (service, _, _, _) = makeTestService(policy: .manual)

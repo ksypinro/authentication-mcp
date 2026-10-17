@@ -131,6 +131,41 @@ struct OAuthProviderTests {
         #expect(await provider.pendingFlowCount == 1, "the flow must stay resumable")
     }
 
+    @Test("A pending device flow holds the call until the caller's deadline")
+    func pendingHonoursWaitSeconds() async throws {
+        // Server-mandated interval (5s) longer than the caller's wait (1s): the
+        // call must still take ~1s, not return instantly — instant replies are
+        // what turned client polling into a busy loop.
+        let http = ScriptedHTTPClient()
+        http.stub(
+            path: "/.well-known/oauth-authorization-server",
+            reply: .json(Fixtures.discoveryDocument()))
+        http.stub(path: "/device", reply: .json([
+            "device_code": "DEV", "user_code": "ABCD-EFGH",
+            "verification_uri": "https://as.example.com/activate",
+            "expires_in": 600, "interval": 5,
+        ]))
+        http.stub(path: "/token", reply: .oauthError("authorization_pending"))
+        let provider = try OAuthAuthorizationProvider(
+            configuration: Fixtures.oauthConfiguration(), http: http,
+            logger: makeSilentLogger(), canReachUserBrowser: false)
+
+        let start = try await provider.beginAuthorization(scopes: Scope.defaults, mode: .device)
+        let clock = ContinuousClock()
+        let began = clock.now
+        let outcome = try await provider.awaitAuthorization(handle: start.handle, timeout: 1)
+        let elapsed = clock.now - began
+
+        guard case .pending = outcome else {
+            Issue.record("expected pending, got \(outcome)")
+            return
+        }
+        #expect(elapsed >= .milliseconds(900), "returned after \(elapsed), before the deadline")
+        #expect(elapsed < .seconds(3))
+        // And it did not poll early to fill the time: the interval is respected.
+        #expect(http.requests(toPath: "/token").isEmpty)
+    }
+
     @Test("A denied authorization is reported as denied, not as a crash")
     func deviceFlowDenied() async throws {
         let http = Fixtures.deviceFlowClient(pollReplies: [

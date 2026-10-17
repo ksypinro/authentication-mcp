@@ -54,8 +54,12 @@ public enum AuthenticationMCPServer {
             version: version,
             title: "Authentication Service",
             instructions: instructions,
+            // Only `tools`. The server does not send log notifications to the
+            // client — its logs go to stderr — so it must not advertise
+            // `logging`: a client that sees it may call `logging/setLevel`
+            // (the MCP Inspector does, right after `initialize`) and treat the
+            // resulting "method not found" as fatal.
             capabilities: Server.Capabilities(
-                logging: .init(),
                 tools: .init(listChanged: false)))
 
         await server.withMethodHandler(ListTools.self) { _ in

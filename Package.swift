@@ -53,6 +53,14 @@ let package = Package(
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .testTarget(
+            name: "AuthenticationHTTPTests",
+            dependencies: [
+                "AuthenticationHTTP",
+                .product(name: "MCP", package: "swift-sdk"),
+            ],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
             name: "AuthenticationKitTests",
             dependencies: [
                 "AuthenticationKit",

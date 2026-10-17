@@ -102,6 +102,11 @@ public enum JSONSchema {
         return .object(schema)
     }
 
+    /// A value that must equal `value` exactly — used for discriminator fields.
+    public static func constant(_ value: Value, _ description: String) -> Value {
+        .object(["const": value, "description": .string(description)])
+    }
+
     /// A string carrying an RFC 3339 timestamp.
     public static func timestamp(_ description: String) -> Value {
         .object([
