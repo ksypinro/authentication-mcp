@@ -81,6 +81,29 @@ struct OutputSchemaConformanceTests {
             try await immediate.call(
                 name: "authenticate", arguments: ["mode": .string("telepathy")], owner: owner),
             to: tool, "invalid input")
+
+        // Hand-off: the pending result carries `redirect_uri`, and both the
+        // refused and the accepted redirect have to fit the same schema.
+        let (handoff, _, _, _) = makeTestService()
+        let pending = try await handoff.call(
+            name: "authenticate", arguments: ["mode": .string("handoff")], owner: owner)
+        #expect(pending.structured["redirect_uri"] != nil)
+        expectConforms(pending, to: tool, "hand-off pending")
+        expectConforms(
+            try await handoff.call(
+                name: "authenticate",
+                arguments: ["redirect_url": .string("https://example.invalid/elsewhere")],
+                owner: owner),
+            to: tool, "hand-off wrong redirect")
+        let rawSignInURL = try #require(pending.structured["verification_url"]?.stringValue)
+        let signInURL = try #require(URL(string: rawSignInURL))
+        let state = try #require(Fixtures.query(of: signInURL)["state"])
+        let completed = try await handoff.call(
+            name: "authenticate",
+            arguments: ["redirect_url": .string("myapp://callback?code=c&state=\(state)")],
+            owner: owner)
+        #expect(completed.structured["status"]?.stringValue == "authenticated")
+        expectConforms(completed, to: tool, "hand-off completed")
     }
 
     // MARK: - revokeAuthentication

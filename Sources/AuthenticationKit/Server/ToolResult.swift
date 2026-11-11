@@ -294,6 +294,14 @@ extension ToolFailure {
                 isRetryable: error.isRetryable,
                 details: ["oauth_error": .string(code)])
 
+        case .redirectRejected:
+            return ToolFailure(
+                code: .invalidInput,
+                message: error.localizedDescription,
+                remediation:
+                    "Send the full URL the browser was redirected to after sign-in, "
+                    + "unchanged, with the `flow_id` of the hand-off sign-in it belongs to.")
+
         case .stateMismatch:
             // A redirect failed CSRF validation. Say so plainly: this can mean an
             // attempted interception, and it should not be retried silently.

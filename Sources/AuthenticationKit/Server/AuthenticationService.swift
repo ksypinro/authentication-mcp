@@ -100,7 +100,7 @@ public actor AuthenticationService {
     // MARK: - authenticate
 
     private static let authenticateParameters: Set<String> = [
-        "scopes", "mode", "flow_id", "wait_seconds", "force",
+        "scopes", "mode", "flow_id", "redirect_url", "wait_seconds", "force",
     ]
 
     private func authenticate(
@@ -118,11 +118,12 @@ public actor AuthenticationService {
         let waitSeconds = try arguments.clampedInt(
             "wait_seconds", default: 30, minimum: 0, maximum: 120)
         let force = try arguments.optionalBool("force", default: false)
+        let capturedRedirect = try capturedRedirectURL(from: arguments)
 
         // Reusing a live session is the common case and must stay cheap: a model
         // that calls `authenticate` before every read should not trigger a new
         // sign-in each time.
-        if !force, explicitFlowID == nil,
+        if !force, explicitFlowID == nil, capturedRedirect == nil,
             let existing = try? await sessionStore.resolveSession(
                 sessionID: nil, owner: owner, requiredScope: nil),
             requestedScopes.allSatisfy({ $0.isSatisfied(by: existing.scopes) })
@@ -151,6 +152,12 @@ public actor AuthenticationService {
         if let resumableHandle {
             handle = resumableHandle
             startedInteraction = nil
+        } else if capturedRedirect != nil {
+            // A redirect belongs to a flow that is already running. Starting a
+            // new one here would pair it with a `state` it can never match.
+            throw ToolInputError(
+                "`redirect_url` was sent but no sign-in is in progress. Call `authenticate` "
+                    + "with `mode: \"handoff\"` first, then send `redirect_url` with its `flow_id`.")
         } else {
             if force, let stale = await sessionStore.pendingHandle(for: owner) {
                 await provider.cancelAuthorization(handle: stale)
@@ -179,9 +186,17 @@ public actor AuthenticationService {
 
         let outcome: AuthorizationOutcome
         do {
-            outcome = try await provider.awaitAuthorization(
-                handle: handle, timeout: TimeInterval(waitSeconds))
+            if let capturedRedirect {
+                outcome = try await provider.completeAuthorization(
+                    handle: handle, redirectURL: capturedRedirect)
+            } else {
+                outcome = try await provider.awaitAuthorization(
+                    handle: handle, timeout: TimeInterval(waitSeconds))
+            }
         } catch let error as OAuthError {
+            // A URL that was never a redirect for this flow leaves the flow
+            // running, so the pending handle stays for the corrected call.
+            if case .redirectRejected = error { throw error }
             await sessionStore.clearPendingHandle(for: owner)
             await auditLog.record(
                 .authenticationFailed,
@@ -221,6 +236,7 @@ public actor AuthenticationService {
                     ("flow_id", .string(handle)),
                     ("user_code", interaction.userCode.map(Value.string)),
                     ("verification_url", .string(interaction.verificationURL.absoluteString)),
+                    ("redirect_uri", interaction.redirectURI.map { .string($0.absoluteString) }),
                     (
                         "verification_url_complete",
                         interaction.verificationURLComplete.map { .string($0.absoluteString) }
@@ -245,8 +261,34 @@ public actor AuthenticationService {
         }
     }
 
+    /// Parses `redirect_url`, the redirect a client captured for a hand-off flow.
+    ///
+    /// Only its shape is checked here. Whether it belongs to the flow — the right
+    /// redirect URI, the right `state` — is the provider's call, because only the
+    /// provider knows what it sent.
+    private func capturedRedirectURL(from arguments: ToolArguments) throws -> URL? {
+        guard let raw = try arguments.optionalString("redirect_url") else { return nil }
+        guard raw.count <= ToolCatalog.maximumRedirectURLLength else {
+            throw ToolInputError(
+                "`redirect_url` must be at most \(ToolCatalog.maximumRedirectURLLength) characters.")
+        }
+        guard let url = URL(string: raw), url.scheme != nil else {
+            throw ToolInputError(
+                "`redirect_url` must be the full URL the browser was redirected to, "
+                    + "for example myapp://callback?code=...&state=...")
+        }
+        return url
+    }
+
     private func pendingSummary(_ interaction: UserInteraction, startedNow: Bool) -> String {
         let lead = startedNow ? "Sign-in started." : "Still waiting for the user."
+        if let redirectURI = interaction.redirectURI {
+            // Addressed to the model, not the user: the next step is a tool call.
+            return
+                "\(lead) Open `verification_url` for the user with a redirect-capture tool, "
+                + "watching for \(redirectURI.absoluteString). Then call `authenticate` again "
+                + "with this `flow_id` and the captured URL as `redirect_url`."
+        }
         if let code = interaction.userCode {
             let url = (interaction.verificationURLComplete ?? interaction.verificationURL)
                 .absoluteString

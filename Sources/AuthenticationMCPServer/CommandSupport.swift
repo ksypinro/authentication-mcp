@@ -198,6 +198,9 @@ enum CommandSupport {
             if let resource = configuration.resourceIndicator {
                 lines.append("  resource:       \(resource.absoluteString)")
             }
+            if let redirect = configuration.handoffRedirectURI {
+                lines.append("  hand-off redirect: \(redirect.absoluteString) (mode 'handoff' enabled)")
+            }
             if !configuration.additionalAuthorizationParameters.isEmpty {
                 let extras = configuration.additionalAuthorizationParameters
                     .sorted { $0.key < $1.key }

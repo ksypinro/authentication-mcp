@@ -181,6 +181,27 @@ way is persisted exactly like a `auth login`.
 `mode: "automatic"` picks `browser` for stdio and `device` otherwise. Force either
 with `auth login --browser` / `--device`.
 
+### Hand-off, for a redirect URI that is not ours to receive
+
+Some client registrations have one fixed redirect URI the server cannot listen
+on — a custom scheme such as `myapp://callback`, which the browser hands to the
+operating system. Set `AUTH_MCP_OAUTH_REDIRECT_URI` to it and `authenticate`
+gains `mode: "handoff"`: the same authorization code + PKCE grant, with the
+redirect caught on the user's machine and handed back.
+
+1. `authenticate(mode: "handoff")` returns `flow_id`, `verification_url` and
+   `redirect_uri`, at once.
+2. The model opens the URL with a capture tool —
+   [`Tools/redirect-capture`](Tools/redirect-capture) is one — which returns the
+   redirect before the OS can open an app.
+3. `authenticate(flow_id, redirect_url)` checks the URL and exchanges the code.
+
+The redirect passes through the model's context, so the server treats it as
+untrusted: it must point at the registered URI and carry the flow's `state`,
+it is accepted once, and the code in it is useless without the PKCE verifier,
+which never leaves the server. `automatic` never picks this mode, because it only
+works when the caller can capture a redirect.
+
 ### Connection-scoped sessions
 
 Sessions are bound to a `SessionOwner` — the stdio process, or one HTTP session. A
@@ -237,6 +258,7 @@ Secrets belong in the environment, not on a command line visible to `ps`.
 | `AUTH_MCP_OAUTH_EXTRA_AUTH_PARAMS` | — | `a=1,b=2` appended to the authorization request |
 | `AUTH_MCP_OAUTH_TIMEOUT_SECONDS` | `300` | How long a user has to approve |
 | `AUTH_MCP_OAUTH_LOOPBACK_PORT` | `0` (OS-assigned) | Fixed redirect port |
+| `AUTH_MCP_OAUTH_REDIRECT_URI` | — | The client's fixed redirect URI, e.g. `myapp://callback`. Enables `mode: "handoff"` |
 | `AUTH_MCP_SCOPE_READ` / `_WRITE` | `data:read` / `data:write`, or none for Google | Scope each tool requires; `none` disables the check |
 
 Endpoint overrides for providers with incomplete metadata:
@@ -313,6 +335,8 @@ Sources/
 Tests/
   AuthenticationKitTests/   Unit and end-to-end tests over InMemoryTransport
   AuthenticationHTTPTests/  The allowlist, checked against the SDK's own validator
+Tools/
+  redirect-capture/         Local MCP server that captures a sign-in redirect in Chrome
 ```
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for what each of these actually does, with
@@ -347,6 +371,13 @@ diagrams for the request lifecycle, both OAuth grants, and the credential store.
 swift build
 swift test
 swift build -c release
+```
+
+The capture tool has its own tests, including one that drives the built server
+binary through a whole hand-off sign-in. They need Chrome, and run it headless:
+
+```bash
+python3 -m unittest discover -s Tools/redirect-capture -v
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the conventions this codebase follows,

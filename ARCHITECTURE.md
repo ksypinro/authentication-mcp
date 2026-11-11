@@ -192,6 +192,68 @@ matters more than it looks: it accepts exactly one redirect and then stops,
 so a stale listener from a cancelled sign-in can never be reused to smuggle in
 a second authorization code.
 
+### Hand-off — the same grant, with the redirect caught by the client
+
+Both roads above assume the server can receive something: a poll answer, or a
+request on 127.0.0.1. A client registered with a fixed custom-scheme redirect
+(`myapp://callback`) breaks that assumption — the browser gives the URL to the
+operating system, which opens an app. `AuthorizationMode.handoff` keeps the
+authorization code + PKCE grant and moves only the catching:
+
+```mermaid
+sequenceDiagram
+    participant Model as MCP client (the model)
+    participant Server as authentication-mcp
+    participant Capture as redirect-capture (user's machine)
+    participant Browser as Chrome
+    participant AS as Authorization Server
+
+    Model->>Server: authenticate(mode: handoff)
+    Note over Server: make state + PKCE verifier, keep both
+    Server-->>Model: flow_id, verification_url, redirect_uri
+
+    Model->>Capture: capture_redirect(verification_url, redirect_uri)
+    Capture->>Browser: launch, pause every document response
+    Browser->>AS: GET /authorize?redirect_uri=myapp://callback&code_challenge=...
+
+    Note over Browser,AS: user signs in, consents
+
+    AS-->>Browser: 302 Location: myapp://callback?code=...&state=...
+    Note over Capture,Browser: taken before Chrome acts on it — no app opens
+    Capture-->>Model: redirect_url
+
+    Model->>Server: authenticate(flow_id, redirect_url)
+    Note over Server: redirect URI matches? state matches? claim the flow
+    Server->>AS: POST /token (code + code_verifier)
+    AS-->>Server: access_token + refresh_token
+    Server-->>Model: status: authenticated, session_id
+```
+
+`automatic` never resolves to it, since it only works for a caller that can
+capture a redirect. It is enabled by `AUTH_MCP_OAUTH_REDIRECT_URI`, and
+[`completeAuthorization`](Sources/AuthenticationKit/OAuth/OAuthAuthorizationProvider.swift)
+is the door the redirect comes back through.
+
+The redirect travels through the model's context, which is the one place in
+this system a token-adjacent value is allowed to go — so the door is narrow:
+
+- **It must be a redirect for this flow.** A URL pointing anywhere but the
+  registered redirect URI is refused as bad input and the flow lives on, because
+  nothing was sent anywhere. A URL with the right address and the wrong `state`
+  is a failed CSRF check: the flow is destroyed and the token endpoint is never
+  called.
+- **It works once.** The flow is removed from the pending table before the first
+  suspension point in the exchange, so a replayed or racing second redirect
+  finds no flow — the same guarantee the single-shot listener gives.
+- **The code alone is worthless.** The PKCE verifier is created in the server
+  and never leaves it; whoever reads the code out of a transcript cannot redeem
+  it.
+
+The capture side lives outside the Swift package, in
+[`Tools/redirect-capture`](Tools/redirect-capture): a standard-library Python MCP
+server that drives Chrome over the DevTools pipe. It is deliberately separate —
+it has to run where the browser is, which is not where this server has to be.
+
 ## Why `auth status` never prompts for your keychain
 
 Every write goes to both halves of
@@ -362,6 +424,8 @@ Sources/
 Tests/
   AuthenticationKitTests/     Unit, and end-to-end over InMemoryTransport; output-schema conformance
   AuthenticationHTTPTests/    HostAllowlist, checked against the SDK's own OriginValidator
+Tools/
+  redirect-capture/           Python MCP server for the hand-off flow: captures the redirect in Chrome
 ```
 
 Every collaborator in the diagrams above is a real type in this tree, not a

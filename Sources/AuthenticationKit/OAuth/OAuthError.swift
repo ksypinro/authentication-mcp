@@ -16,6 +16,9 @@ public enum OAuthError: Error, Sendable, Equatable {
     case malformedResponse(reason: String)
     /// The redirect came back with a `state` that does not match the one we sent.
     case stateMismatch
+    /// A redirect handed back by the client is not one this flow can accept —
+    /// wrong redirect URI, or a flow that is not waiting for one.
+    case redirectRejected(reason: String)
     /// The user declined the authorization request.
     case accessDenied(reason: String?)
     /// The user did not complete the flow before the grant expired.
@@ -46,6 +49,8 @@ extension OAuthError: LocalizedError {
             return "Malformed response from authorization server: \(reason)"
         case .stateMismatch:
             return "Authorization redirect failed CSRF state validation"
+        case .redirectRejected(let reason):
+            return "The redirect was not accepted: \(reason)"
         case .accessDenied(let reason):
             return "Authorization was denied\(reason.map { ": \($0)" } ?? "")"
         case .authorizationExpired:

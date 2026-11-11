@@ -4,13 +4,17 @@ import MCP
 
 /// An ``AuthorizationProvider`` that speaks OAuth 2.1 to a real authorization server.
 ///
-/// Supports two interactive grants and shares everything else between them:
+/// Supports three interactive flows and shares everything else between them:
 ///
 /// - **Device authorization grant** (RFC 8628) — the default. The user approves on
 ///   whatever device has a browser, which is the only thing that works when this
 ///   server runs remotely or the MCP client is on another machine.
 /// - **Authorization code with PKCE** (RFC 7636, over an RFC 8252 loopback
 ///   redirect) — used when the server shares a machine with the user.
+/// - **Authorization code with PKCE, redirect handed back by the client** — for a
+///   client registration whose redirect URI is fixed and not the server's to
+///   receive (a custom scheme). The MCP client captures the redirect and returns
+///   it through ``completeAuthorization(handle:redirectURL:)``.
 ///
 /// Refresh follows RFC 6749 §6 and revocation RFC 7009.
 public actor OAuthAuthorizationProvider: AuthorizationProvider {
@@ -57,11 +61,13 @@ public actor OAuthAuthorizationProvider: AuthorizationProvider {
     private enum PendingFlow {
         case device(DeviceFlow)
         case browser(BrowserFlow)
+        case handoff(HandoffFlow)
 
         var interaction: UserInteraction {
             switch self {
             case .device(let flow): return flow.interaction
             case .browser(let flow): return flow.interaction
+            case .handoff(let flow): return flow.interaction
             }
         }
 
@@ -79,12 +85,24 @@ public actor OAuthAuthorizationProvider: AuthorizationProvider {
         var nextPollAllowedAt: Date
     }
 
-    private struct BrowserFlow {
-        let listener: LoopbackRedirectListener
+    /// What an authorization-code exchange needs, however the redirect arrives.
+    private struct CodeGrant {
         let codeVerifier: String
         let stateNonce: String
         let redirectURI: URL
         let scopes: Set<Scope>
+    }
+
+    /// A code flow whose redirect the client captures. It holds no listener and
+    /// no task: nothing happens until the redirect is handed back.
+    private struct HandoffFlow {
+        let grant: CodeGrant
+        let interaction: UserInteraction
+    }
+
+    private struct BrowserFlow {
+        let listener: LoopbackRedirectListener
+        let grant: CodeGrant
         let interaction: UserInteraction
         /// Started eagerly at `beginAuthorization` so the redirect is caught even
         /// if the caller takes a while to come back and wait for it.
@@ -108,6 +126,8 @@ public actor OAuthAuthorizationProvider: AuthorizationProvider {
             return try await beginDeviceFlow(scopes: requestedScopes, metadata: metadata)
         case .browser:
             return try await beginBrowserFlow(scopes: requestedScopes, metadata: metadata)
+        case .handoff:
+            return try beginHandoffFlow(scopes: requestedScopes, metadata: metadata)
         case .automatic:
             // `resolve` never returns `.automatic`.
             throw OAuthError.invalidConfiguration(reason: "unresolved authorization mode")
@@ -131,6 +151,16 @@ public actor OAuthAuthorizationProvider: AuthorizationProvider {
                 throw OAuthError.endpointUnavailable(name: "authorization_endpoint")
             }
             return .browser
+        case .handoff:
+            guard configuration.handoffRedirectURI != nil else {
+                throw OAuthError.invalidConfiguration(
+                    reason: "hand-off sign-in is not configured; set AUTH_MCP_OAUTH_REDIRECT_URI "
+                        + "to the redirect URI registered for this client")
+            }
+            guard authorizationEndpoint(from: metadata) != nil else {
+                throw OAuthError.endpointUnavailable(name: "authorization_endpoint")
+            }
+            return .handoff
         case .automatic:
             if canReachUserBrowser, authorizationEndpoint(from: metadata) != nil {
                 return .browser
@@ -202,21 +232,7 @@ public actor OAuthAuthorizationProvider: AuthorizationProvider {
         guard let endpoint = authorizationEndpoint(from: metadata) else {
             throw OAuthError.endpointUnavailable(name: "authorization_endpoint")
         }
-        // OAuth 2.1 makes PKCE mandatory for this grant. A server that publishes
-        // its supported methods and omits S256 cannot run the flow safely.
-        if metadata.explicitlyRejectsS256PKCE {
-            throw OAuthError.invalidConfiguration(
-                reason: "authorization server does not support PKCE S256, which OAuth 2.1 requires")
-        }
-
-        let codeVerifier = PKCE.makeVerifier()
-        let codeChallenge: String
-        do {
-            codeChallenge = try PKCE.makeChallenge(from: codeVerifier)
-        } catch {
-            throw OAuthError.invalidConfiguration(
-                reason: "PKCE S256 is unavailable on this platform")
-        }
+        let pkce = try makePKCEPair(metadata: metadata)
         let stateNonce = Self.makeNonce()
 
         let listener = LoopbackRedirectListener(logger: logger)
@@ -227,7 +243,7 @@ public actor OAuthAuthorizationProvider: AuthorizationProvider {
             redirectURI: redirectURI,
             scopes: scopes,
             stateNonce: stateNonce,
-            codeChallenge: codeChallenge)
+            codeChallenge: pkce.challenge)
 
         let timeout = configuration.authorizationTimeout
         let redirectTask = Task { try await listener.waitForRedirect(timeout: timeout) }
@@ -245,10 +261,11 @@ public actor OAuthAuthorizationProvider: AuthorizationProvider {
         pendingFlows[handle] = .browser(
             BrowserFlow(
                 listener: listener,
-                codeVerifier: codeVerifier,
-                stateNonce: stateNonce,
-                redirectURI: redirectURI,
-                scopes: scopes,
+                grant: CodeGrant(
+                    codeVerifier: pkce.verifier,
+                    stateNonce: stateNonce,
+                    redirectURI: redirectURI,
+                    scopes: scopes),
                 interaction: interaction,
                 redirectTask: redirectTask))
 
@@ -265,6 +282,75 @@ public actor OAuthAuthorizationProvider: AuthorizationProvider {
             ])
 
         return AuthorizationStart(handle: handle, interaction: interaction)
+    }
+
+    private func beginHandoffFlow(
+        scopes: Set<Scope>,
+        metadata: AuthorizationServerMetadata
+    ) throws -> AuthorizationStart {
+        guard let endpoint = authorizationEndpoint(from: metadata) else {
+            throw OAuthError.endpointUnavailable(name: "authorization_endpoint")
+        }
+        guard let redirectURI = configuration.handoffRedirectURI else {
+            throw OAuthError.invalidConfiguration(reason: "hand-off sign-in is not configured")
+        }
+        let pkce = try makePKCEPair(metadata: metadata)
+        let stateNonce = Self.makeNonce()
+
+        let authorizationURL = try buildAuthorizationURL(
+            endpoint: endpoint,
+            redirectURI: redirectURI,
+            scopes: scopes,
+            stateNonce: stateNonce,
+            codeChallenge: pkce.challenge)
+
+        let interaction = UserInteraction(
+            mode: .handoff,
+            verificationURL: authorizationURL,
+            redirectURI: redirectURI,
+            expiresAt: now().addingTimeInterval(configuration.authorizationTimeout),
+            instructions:
+                "Sign in in the browser window that opens. "
+                + "It closes by itself once sign-in is done.")
+
+        let handle = Self.makeHandle()
+        pendingFlows[handle] = .handoff(
+            HandoffFlow(
+                grant: CodeGrant(
+                    codeVerifier: pkce.verifier,
+                    stateNonce: stateNonce,
+                    redirectURI: redirectURI,
+                    scopes: scopes),
+                interaction: interaction))
+
+        logger.info(
+            "Started hand-off authorization",
+            metadata: [
+                "flow": .string(handle),
+                "scopes": .string(scopes.scopeString),
+                "redirect_uri": .string(redirectURI.absoluteString),
+            ])
+
+        return AuthorizationStart(handle: handle, interaction: interaction)
+    }
+
+    /// A fresh PKCE verifier and its S256 challenge.
+    private func makePKCEPair(
+        metadata: AuthorizationServerMetadata
+    ) throws -> (verifier: String, challenge: String) {
+        // OAuth 2.1 makes PKCE mandatory for this grant. A server that publishes
+        // its supported methods and omits S256 cannot run the flow safely.
+        if metadata.explicitlyRejectsS256PKCE {
+            throw OAuthError.invalidConfiguration(
+                reason: "authorization server does not support PKCE S256, which OAuth 2.1 requires")
+        }
+        let verifier = PKCE.makeVerifier()
+        do {
+            return (verifier, try PKCE.makeChallenge(from: verifier))
+        } catch {
+            throw OAuthError.invalidConfiguration(
+                reason: "PKCE S256 is unavailable on this platform")
+        }
     }
 
     private func buildAuthorizationURL(
@@ -332,7 +418,61 @@ public actor OAuthAuthorizationProvider: AuthorizationProvider {
             return try await awaitDeviceFlow(handle: handle, flow: deviceFlow, deadline: deadline)
         case .browser(let browserFlow):
             return try await awaitBrowserFlow(handle: handle, flow: browserFlow, deadline: deadline)
+        case .handoff(let handoffFlow):
+            // Nothing arrives by waiting: this flow only moves when the client
+            // hands the redirect back, so the caller gets control straight away.
+            return .pending(handoffFlow.interaction)
         }
+    }
+
+    // MARK: - Completing a hand-off
+
+    public func completeAuthorization(
+        handle: String,
+        redirectURL: URL
+    ) async throws -> AuthorizationOutcome {
+        guard let flow = pendingFlows[handle] else {
+            throw OAuthError.unknownFlow(handle: handle)
+        }
+        if now() >= flow.expiresAt {
+            await discard(handle: handle)
+            return .expired
+        }
+        guard case .handoff(let handoffFlow) = flow else {
+            throw OAuthError.redirectRejected(
+                reason: "this sign-in is not waiting for a redirect; only a 'handoff' flow takes one")
+        }
+        // A URL for somewhere else is a caller mistake, not an attack on this
+        // flow — the model may have passed the sign-in URL back, say. Nothing has
+        // been sent anywhere, so the flow stays alive for the right URL.
+        let expected = handoffFlow.grant.redirectURI
+        guard Self.isRedirect(redirectURL, to: expected) else {
+            throw OAuthError.redirectRejected(
+                reason: "it does not point at \(expected.absoluteString)")
+        }
+
+        // Single use, like the loopback listener: the flow is claimed before the
+        // first suspension, so a second redirect for the same handle — replayed,
+        // or racing this one — finds nothing to complete.
+        pendingFlows.removeValue(forKey: handle)
+        return try await exchangeAuthorizationCode(
+            redirectURL: redirectURL, handle: handle, grant: handoffFlow.grant, label: "Hand-off")
+    }
+
+    /// Whether `url` is a redirect to `redirectURI`, ignoring its query.
+    ///
+    /// Scheme and host compare case-insensitively (RFC 3986 §6.2.2.1); the path
+    /// compares exactly, as an authorization server compares it.
+    static func isRedirect(_ url: URL, to redirectURI: URL) -> Bool {
+        guard
+            let candidate = URLComponents(url: url, resolvingAgainstBaseURL: false),
+            let expected = URLComponents(url: redirectURI, resolvingAgainstBaseURL: false)
+        else { return false }
+        return candidate.scheme?.lowercased() == expected.scheme?.lowercased()
+            && candidate.host?.lowercased() == expected.host?.lowercased()
+            && candidate.port == expected.port
+            && candidate.path == expected.path
+            && candidate.user == nil && candidate.password == nil
     }
 
     private func awaitDeviceFlow(
@@ -485,14 +625,15 @@ public actor OAuthAuthorizationProvider: AuthorizationProvider {
             return .pending(flow.interaction)
         case .redirected(let redirectURL):
             return try await exchangeAuthorizationCode(
-                redirectURL: redirectURL, handle: handle, flow: flow)
+                redirectURL: redirectURL, handle: handle, grant: flow.grant, label: "Browser")
         }
     }
 
     private func exchangeAuthorizationCode(
         redirectURL: URL,
         handle: String,
-        flow: BrowserFlow
+        grant: CodeGrant,
+        label: String
     ) async throws -> AuthorizationOutcome {
         guard let components = URLComponents(url: redirectURL, resolvingAgainstBaseURL: false) else {
             await discard(handle: handle)
@@ -504,7 +645,7 @@ public actor OAuthAuthorizationProvider: AuthorizationProvider {
 
         // CSRF check first: an attacker-supplied redirect must not reach the
         // token endpoint, even to report an error.
-        guard let returnedState = query["state"], constantTimeEquals(returnedState, flow.stateNonce)
+        guard let returnedState = query["state"], constantTimeEquals(returnedState, grant.stateNonce)
         else {
             await discard(handle: handle)
             throw OAuthError.stateMismatch
@@ -533,8 +674,8 @@ public actor OAuthAuthorizationProvider: AuthorizationProvider {
         var parameters = [
             "grant_type": OAuthConstants.authorizationCodeGrant,
             "code": code,
-            "redirect_uri": flow.redirectURI.absoluteString,
-            "code_verifier": flow.codeVerifier,
+            "redirect_uri": grant.redirectURI.absoluteString,
+            "code_verifier": grant.codeVerifier,
         ]
         if let resource = configuration.resourceIndicator {
             parameters["resource"] = resource.absoluteString
@@ -544,9 +685,9 @@ public actor OAuthAuthorizationProvider: AuthorizationProvider {
             let response = try await tokenClient.requestToken(
                 endpoint: tokenEndpoint, parameters: parameters)
             let tokens = response.makeTokenSet(
-                requestedScopes: flow.scopes, issuer: metadata.issuer, now: now())
+                requestedScopes: grant.scopes, issuer: metadata.issuer, now: now())
             await discard(handle: handle)
-            logger.info("Browser authorization approved", metadata: ["flow": .string(handle)])
+            logger.info("\(label) authorization approved", metadata: ["flow": .string(handle)])
             return .completed(tokens)
         } catch {
             await discard(handle: handle)
