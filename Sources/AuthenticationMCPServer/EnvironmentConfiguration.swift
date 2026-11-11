@@ -236,6 +236,7 @@ enum EnvironmentConfiguration {
                     value("AUTH_MCP_OAUTH_TIMEOUT_SECONDS").flatMap(Int.init) ?? 300),
                 opensBrowserAutomatically: flag(
                     "AUTH_MCP_OAUTH_OPEN_BROWSER", default: canReachUserBrowser),
+                handoffRedirectURI: try url("AUTH_MCP_OAUTH_REDIRECT_URI"),
                 additionalAuthorizationParameters: keyValuePairs(
                     "AUTH_MCP_OAUTH_EXTRA_AUTH_PARAMS"))
 

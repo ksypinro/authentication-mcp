@@ -21,6 +21,10 @@ public enum ToolCatalog {
         [authenticate, revokeAuthentication, fetchData, updatedData]
     }
 
+    /// The longest `redirect_url` accepted. An authorization redirect is a short
+    /// URL with a code and a state; anything near this size is not one.
+    public static let maximumRedirectURLLength = 4096
+
     // MARK: - Result shape
 
     /// The output schema for a tool: its success shape, or the shared failure shape.
@@ -84,6 +88,12 @@ public enum ToolCatalog {
             whether they have finished. Keep polling with the same `flow_id`; do not \
             start a second flow, which would invalidate the code the user is looking at.
 
+            `mode: "handoff"` is for when you can capture a browser redirect yourself, \
+            with a tool such as `capture_redirect`. The `pending` result then carries a \
+            `verification_url` and a `redirect_uri` and no code: open the first for the \
+            user, capture the navigation to the second, and call this tool again with \
+            `flow_id` and the full captured URL as `redirect_url`.
+
             Access tokens are deliberately never returned. Pass the `session_id` from \
             this result to the other tools instead.
             """,
@@ -102,7 +112,10 @@ public enum ToolCatalog {
                     How the user signs in. 'device' shows a code to type on any device and \
                     is the only mode that works when this server is remote. 'browser' opens \
                     the local browser, and only works when the server runs on the user's own \
-                    machine. 'automatic' picks the right one.
+                    machine. 'handoff' returns a sign-in URL and a `redirect_uri` for you to \
+                    capture and hand back as `redirect_url`; use it only when you have a tool \
+                    that can capture a browser redirect. 'automatic' picks 'device' or \
+                    'browser', never 'handoff'.
                     """,
                     enumValues: AuthorizationMode.allCases.map(\.rawValue),
                     default: AuthorizationMode.automatic.rawValue),
@@ -111,10 +124,18 @@ public enum ToolCatalog {
                     The `flow_id` from an earlier `pending` result, to check whether the \
                     user has finished. Omit to start a new sign-in.
                     """),
+                "redirect_url": JSONSchema.string(
+                    """
+                    Hand-off sign-in only: the full URL the browser was redirected to, \
+                    exactly as captured, including its query string. Send it with the \
+                    `flow_id` it belongs to. It is accepted once.
+                    """,
+                    maxLength: ToolCatalog.maximumRedirectURLLength),
                 "wait_seconds": JSONSchema.integer(
                     """
                     How long to wait for the user before returning `pending`. Keep this \
-                    well under the client's tool-call timeout; the flow stays alive either way.
+                    well under the client's tool-call timeout; the flow stays alive either \
+                    way. A hand-off sign-in never waits: it returns at once.
                     """,
                     minimum: 0,
                     maximum: 120,
@@ -166,6 +187,12 @@ public enum ToolCatalog {
                 "user_code": JSONSchema.string(
                     "Present for a pending device sign-in. Show this to the user verbatim."),
                 "verification_url": JSONSchema.string("Where the user completes sign-in."),
+                "redirect_uri": JSONSchema.string(
+                    """
+                    Present for a pending hand-off sign-in: where the browser ends up after \
+                    sign-in. Capture the full URL of that navigation and send it back as \
+                    `redirect_url`.
+                    """),
                 "verification_url_complete": JSONSchema.string(
                     "The same URL with the code pre-filled, when the provider offers one."),
                 "expires_at": JSONSchema.timestamp("When the pending request stops being accepted."),

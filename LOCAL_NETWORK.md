@@ -256,6 +256,12 @@ A few things worth knowing:
 - **The mock provider approves immediately**, so you won't see the pending step.
   To rehearse what a real provider feels like, start the server with
   `AUTH_MCP_MOCK_POLICY=delay:15` — sign-in then stays pending for 15 seconds.
+- **A fixed redirect URI needs the hand-off flow instead.** If the identity
+  provider only has a custom-scheme redirect registered for your client
+  (`myapp://callback`), the device grant may not be on offer. Set
+  `AUTH_MCP_OAUTH_REDIRECT_URI` on the server and add the
+  [redirect-capture](Tools/redirect-capture) tool to the client machine; the
+  model then signs in with `authenticate(mode: "handoff")`.
 - **Each connection signs in separately.** A sign-in belongs to one client
   connection. It is not shared with other devices, and not with `auth login` on
   the server machine.

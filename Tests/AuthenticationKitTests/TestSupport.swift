@@ -225,7 +225,8 @@ enum Fixtures {
     }
 
     static func oauthConfiguration(
-        scopes: Set<Scope> = Scope.defaults
+        scopes: Set<Scope> = Scope.defaults,
+        handoffRedirectURI: URL? = nil
     ) -> OAuthProviderConfiguration {
         OAuthProviderConfiguration(
             issuer: issuer,
@@ -233,7 +234,17 @@ enum Fixtures {
             defaultScopes: scopes,
             resourceIndicator: URL(string: "https://api.example.com"),
             authorizationTimeout: 300,
-            opensBrowserAutomatically: false)
+            opensBrowserAutomatically: false,
+            handoffRedirectURI: handoffRedirectURI)
+    }
+
+    /// The fixed, custom-scheme redirect URI the hand-off tests register.
+    static let handoffRedirectURI = URL(string: "myapp://callback")!
+
+    /// The query of a URL as a dictionary.
+    static func query(of url: URL) -> [String: String] {
+        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        return Dictionary(items.map { ($0.name, $0.value ?? "") }, uniquingKeysWith: { first, _ in first })
     }
 
     /// Wires a client stubbed for a full, successful device-grant sign-in.

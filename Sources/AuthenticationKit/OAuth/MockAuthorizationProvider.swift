@@ -47,6 +47,8 @@ public actor MockAuthorizationProvider: AuthorizationProvider {
         let scopes: Set<Scope>
         let interaction: UserInteraction
         let startedAt: Date
+        /// Set for a hand-off flow: the `state` its redirect must carry.
+        var handoffState: String? = nil
         var decision: Decision
 
         enum Decision: Equatable {
@@ -89,6 +91,10 @@ public actor MockAuthorizationProvider: AuthorizationProvider {
         let handle = "mockflow_" + UUID().uuidString.prefix(8).lowercased()
         let resolvedMode: AuthorizationMode = (mode == .automatic) ? .device : mode
 
+        if resolvedMode == .handoff {
+            return beginHandoff(handle: handle, userCode: userCode, scopes: requestedScopes)
+        }
+
         let verificationURL = URL(string: "https://example.invalid/device")!
         let interaction = UserInteraction(
             mode: resolvedMode,
@@ -115,6 +121,80 @@ public actor MockAuthorizationProvider: AuthorizationProvider {
         return AuthorizationStart(handle: handle, interaction: interaction)
     }
 
+    /// The redirect URI a mock hand-off flow pretends is registered.
+    public static let handoffRedirectURI = URL(string: "myapp://callback")!
+
+    /// Starts a hand-off flow. There is no page behind the sign-in URL; a caller
+    /// completes the flow by sending `myapp://callback?code=<anything>&state=<state>`,
+    /// taking `state` from the sign-in URL's query, as a real capture would.
+    private func beginHandoff(
+        handle: String,
+        userCode: String,
+        scopes: Set<Scope>
+    ) -> AuthorizationStart {
+        let state = UUID().uuidString.lowercased()
+        let interaction = UserInteraction(
+            mode: .handoff,
+            verificationURL: URL(string: "https://example.invalid/authorize?state=\(state)")!,
+            redirectURI: Self.handoffRedirectURI,
+            expiresAt: now().addingTimeInterval(flowLifetime),
+            instructions: "Mock provider: no browser needed. Send back a redirect carrying the state.")
+
+        flows[handle] = MockFlow(
+            userCode: userCode,
+            scopes: scopes,
+            interaction: interaction,
+            startedAt: now(),
+            handoffState: state,
+            decision: policy == .immediate ? .undecided : initialDecision())
+
+        logger.notice(
+            "Mock hand-off authorization started — not a real identity provider",
+            metadata: ["flow": .string(handle)])
+
+        return AuthorizationStart(handle: handle, interaction: interaction)
+    }
+
+    public func completeAuthorization(
+        handle: String,
+        redirectURL: URL
+    ) async throws -> AuthorizationOutcome {
+        guard let flow = flows[handle] else { throw OAuthError.unknownFlow(handle: handle) }
+
+        if now() >= flow.interaction.expiresAt {
+            flows.removeValue(forKey: handle)
+            return .expired
+        }
+        guard let expectedState = flow.handoffState else {
+            throw OAuthError.redirectRejected(
+                reason: "this sign-in is not waiting for a redirect; only a 'handoff' flow takes one")
+        }
+        guard OAuthAuthorizationProvider.isRedirect(redirectURL, to: Self.handoffRedirectURI) else {
+            throw OAuthError.redirectRejected(
+                reason: "it does not point at \(Self.handoffRedirectURI.absoluteString)")
+        }
+
+        // From here the flow is spent whatever happens, as with the real provider.
+        flows.removeValue(forKey: handle)
+
+        let items = URLComponents(url: redirectURL, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        let query = Dictionary(
+            items.map { ($0.name, $0.value ?? "") }, uniquingKeysWith: { first, _ in first })
+        guard let state = query["state"], constantTimeEquals(state, expectedState) else {
+            throw OAuthError.stateMismatch
+        }
+        if query["error"] == "access_denied" {
+            return .denied(reason: query["error_description"])
+        }
+        if case .denied(let reason) = flow.decision {
+            return .denied(reason: reason)
+        }
+        guard let code = query["code"], !code.isEmpty else {
+            throw OAuthError.malformedResponse(reason: "redirect carried neither code nor error")
+        }
+        return .completed(issueTokens(scopes: flow.scopes))
+    }
+
     public func awaitAuthorization(
         handle: String,
         timeout: TimeInterval
@@ -124,6 +204,11 @@ public actor MockAuthorizationProvider: AuthorizationProvider {
         if now() >= flow.interaction.expiresAt {
             flows.removeValue(forKey: handle)
             return .expired
+        }
+
+        // A hand-off flow only moves when the redirect is handed back.
+        if flow.handoffState != nil {
+            return .pending(flow.interaction)
         }
 
         // Apply a delayed policy once its delay has elapsed.

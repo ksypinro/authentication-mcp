@@ -125,6 +125,183 @@ struct ToolTests {
         #expect(completed.sessionID != nil)
     }
 
+    // MARK: - Hand-off sign-in
+
+    /// Starts a hand-off sign-in and returns its flow id and the `state` a
+    /// capture tool would see come back on the redirect.
+    private func startHandoff(
+        _ service: AuthenticationService
+    ) async throws -> (flowID: String, state: String, pending: CallTool.Result) {
+        let pending = try await service.call(
+            name: "authenticate", arguments: ["mode": .string("handoff")], owner: owner)
+        let flowID = try #require(pending.structured["flow_id"]?.stringValue)
+        let rawSignInURL = try #require(pending.structured["verification_url"]?.stringValue)
+        let signInURL = try #require(URL(string: rawSignInURL))
+        let state = try #require(Fixtures.query(of: signInURL)["state"])
+        return (flowID, state, pending)
+    }
+
+    @Test("A hand-off sign-in returns the URL to open and the redirect to capture, at once")
+    func handoffPending() async throws {
+        let (service, _, _, _) = makeTestService()
+
+        let clock = ContinuousClock()
+        let began = clock.now
+        let (_, _, pending) = try await startHandoff(service)
+
+        #expect(pending.isOK)
+        #expect(pending.structured["status"]?.stringValue == "pending")
+        #expect(pending.structured["redirect_uri"]?.stringValue == "myapp://callback")
+        #expect(pending.structured["user_code"] == nil)
+        // The default `wait_seconds` is 30; a hand-off must not sit on it.
+        #expect(clock.now - began < .seconds(2))
+        // The summary is what tells the model its next move.
+        #expect(pending.textContent.contains("redirect_url"))
+    }
+
+    @Test("Handing the captured redirect back completes the sign-in without leaking it")
+    func handoffCompletes() async throws {
+        let (service, _, _, _) = makeTestService()
+        let (flowID, state, _) = try await startHandoff(service)
+
+        let completed = try await service.call(
+            name: "authenticate",
+            arguments: [
+                "flow_id": .string(flowID),
+                "redirect_url": .string("myapp://callback?code=SECRET-CODE&state=\(state)"),
+            ],
+            owner: owner)
+
+        #expect(completed.isOK)
+        #expect(completed.structured["status"]?.stringValue == "authenticated")
+        #expect(completed.sessionID?.hasPrefix("sess_") == true)
+
+        let rendered = completed.textContent + (completed.structuredContent?.prettyJSONString ?? "")
+        #expect(!rendered.contains("SECRET-CODE"))
+        #expect(!rendered.contains("mock_access"))
+
+        // The session works, and the same redirect cannot be played twice.
+        let read = try await service.call(
+            name: "updatedData",
+            arguments: ["id": .string("doc"), "value": .object(["a": .int(1)])], owner: owner)
+        #expect(read.isOK)
+        let replay = try await service.call(
+            name: "authenticate",
+            arguments: [
+                "flow_id": .string(flowID),
+                "redirect_url": .string("myapp://callback?code=SECRET-CODE&state=\(state)"),
+            ],
+            owner: owner)
+        #expect(replay.errorCode == "authorization_expired")
+    }
+
+    @Test("The redirect is matched to the pending flow when flow_id is left out")
+    func handoffWithoutFlowID() async throws {
+        let (service, _, _, _) = makeTestService()
+        let (_, state, _) = try await startHandoff(service)
+
+        let completed = try await service.call(
+            name: "authenticate",
+            arguments: ["redirect_url": .string("myapp://callback?code=c&state=\(state)")],
+            owner: owner)
+
+        #expect(completed.structured["status"]?.stringValue == "authenticated")
+    }
+
+    @Test("A wrong URL is an input error, and the right one still works afterwards")
+    func handoffWrongURLKeepsFlow() async throws {
+        let (service, _, _, _) = makeTestService()
+        let (flowID, state, pending) = try await startHandoff(service)
+
+        // The classic slip: handing the sign-in URL back instead of the redirect.
+        let wrong = try await service.call(
+            name: "authenticate",
+            arguments: [
+                "flow_id": .string(flowID),
+                "redirect_url": pending.structured["verification_url"] ?? .null,
+            ],
+            owner: owner)
+        #expect(wrong.errorCode == "invalid_input")
+
+        let completed = try await service.call(
+            name: "authenticate",
+            arguments: [
+                "flow_id": .string(flowID),
+                "redirect_url": .string("myapp://callback?code=c&state=\(state)"),
+            ],
+            owner: owner)
+        #expect(completed.structured["status"]?.stringValue == "authenticated")
+    }
+
+    @Test("A redirect carrying the wrong state is refused as a security failure")
+    func handoffWrongState() async throws {
+        let (service, _, _, _) = makeTestService()
+        let (flowID, _, _) = try await startHandoff(service)
+
+        let forged = try await service.call(
+            name: "authenticate",
+            arguments: [
+                "flow_id": .string(flowID),
+                "redirect_url": .string("myapp://callback?code=stolen&state=forged"),
+            ],
+            owner: owner)
+
+        #expect(forged.errorCode == "authorization_failed")
+        #expect(forged.errorMessage?.contains("security check") == true)
+        // The flow is spent, so nothing is left to pair a second attempt with.
+        let fetch = try await service.call(
+            name: "fetchData", arguments: ["id": .string("doc")], owner: owner)
+        #expect(fetch.errorCode == "not_authenticated")
+    }
+
+    @Test("A redirect with no sign-in in progress does not start one")
+    func redirectWithoutFlow() async throws {
+        let (service, provider, _, _) = makeTestService()
+
+        let result = try await service.call(
+            name: "authenticate",
+            arguments: ["redirect_url": .string("myapp://callback?code=c&state=s")],
+            owner: owner)
+
+        #expect(result.errorCode == "invalid_input")
+        #expect(result.errorMessage?.contains("handoff") == true)
+        #expect(await provider.pendingFlowCount == 0)
+    }
+
+    @Test("A redirect sent to a device sign-in is refused and the code stays valid")
+    func redirectToDeviceFlow() async throws {
+        let (service, provider, _, _) = makeTestService(policy: .manual)
+        let pending = try await service.call(
+            name: "authenticate", arguments: ["wait_seconds": .int(0)], owner: owner)
+        let userCode = try #require(pending.structured["user_code"]?.stringValue)
+
+        let result = try await service.call(
+            name: "authenticate",
+            arguments: ["redirect_url": .string("myapp://callback?code=c&state=s")],
+            owner: owner)
+        #expect(result.errorCode == "invalid_input")
+
+        await provider.approve(userCode: userCode)
+        let completed = try await service.call(
+            name: "authenticate", arguments: ["wait_seconds": .int(0)], owner: owner)
+        #expect(completed.structured["status"]?.stringValue == "authenticated")
+    }
+
+    @Test(
+        "A malformed redirect_url is rejected before it reaches the provider",
+        arguments: ["not a url", "callback?code=c", String(repeating: "a", count: 5000)])
+    func malformedRedirectURL(_ raw: String) async throws {
+        let (service, _, _, _) = makeTestService()
+        let (flowID, _, _) = try await startHandoff(service)
+
+        let result = try await service.call(
+            name: "authenticate",
+            arguments: ["flow_id": .string(flowID), "redirect_url": .string(raw)],
+            owner: owner)
+
+        #expect(result.errorCode == "invalid_input")
+    }
+
     @Test("Polling a pending sign-in is never rate limited")
     func pollingIsNotRateLimited() async throws {
         // Over HTTP the device grant is the only way to sign in, and a person can

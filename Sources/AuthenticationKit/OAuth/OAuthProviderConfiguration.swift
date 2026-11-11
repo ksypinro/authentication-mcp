@@ -56,6 +56,13 @@ public struct OAuthProviderConfiguration: Sendable, Equatable {
     public let authorizationTimeout: TimeInterval
     /// Whether to open the system browser automatically for the `browser` mode.
     public let opensBrowserAutomatically: Bool
+    /// The redirect URI registered for this client when it is not one the server
+    /// can receive itself — typically a custom scheme such as `myapp://callback`.
+    ///
+    /// Setting it enables the `handoff` mode: the server sends this URI to the
+    /// authorization server unchanged, and the MCP client captures the redirect
+    /// and hands it back. `nil` leaves `handoff` unavailable.
+    public let handoffRedirectURI: URL?
 
     /// Extra query parameters appended to the authorization request.
     ///
@@ -102,6 +109,7 @@ public struct OAuthProviderConfiguration: Sendable, Equatable {
         loopbackPort: UInt16 = 0,
         authorizationTimeout: TimeInterval = 300,
         opensBrowserAutomatically: Bool = true,
+        handoffRedirectURI: URL? = nil,
         additionalAuthorizationParameters: [String: String] = [:]
     ) {
         self.issuer = issuer
@@ -112,6 +120,7 @@ public struct OAuthProviderConfiguration: Sendable, Equatable {
         self.loopbackPort = loopbackPort
         self.authorizationTimeout = authorizationTimeout
         self.opensBrowserAutomatically = opensBrowserAutomatically
+        self.handoffRedirectURI = handoffRedirectURI
         self.additionalAuthorizationParameters = additionalAuthorizationParameters
     }
 
@@ -161,6 +170,18 @@ public struct OAuthProviderConfiguration: Sendable, Equatable {
         }
         guard !authentication.clientID.isEmpty else {
             throw OAuthError.invalidConfiguration(reason: "client_id is empty")
+        }
+        if let handoffRedirectURI {
+            guard let redirectScheme = handoffRedirectURI.scheme, !redirectScheme.isEmpty else {
+                throw OAuthError.invalidConfiguration(
+                    reason: "the hand-off redirect URI must be absolute, e.g. myapp://callback")
+            }
+            // RFC 6749 §3.1.2: a redirect URI must not carry a fragment. One here
+            // would also defeat the match against the captured redirect.
+            guard handoffRedirectURI.fragment == nil else {
+                throw OAuthError.invalidConfiguration(
+                    reason: "the hand-off redirect URI must not include a fragment")
+            }
         }
     }
 }

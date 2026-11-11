@@ -1,4 +1,5 @@
 import Foundation
+import MCP
 import Testing
 
 @testable import AuthenticationKit
@@ -239,6 +240,208 @@ struct OAuthProviderTests {
 
         let start = try await provider.beginAuthorization(scopes: Scope.defaults, mode: .automatic)
         #expect(start.interaction.mode == .device)
+    }
+
+    // MARK: - Hand-off (client-captured redirect)
+
+    /// A provider whose client is registered with `myapp://callback`, and a
+    /// started hand-off flow on it.
+    private func startHandoff(
+        tokenReplies: [ScriptedHTTPClient.Reply] = [Fixtures.tokenResponse(accessToken: "handoff-token")]
+    ) async throws -> (
+        provider: OAuthAuthorizationProvider, http: ScriptedHTTPClient, start: AuthorizationStart,
+        sent: [String: String]
+    ) {
+        let http = Fixtures.deviceFlowClient(pollReplies: tokenReplies)
+        let provider = try makeProvider(
+            http: http,
+            configuration: Fixtures.oauthConfiguration(
+                handoffRedirectURI: Fixtures.handoffRedirectURI))
+        let start = try await provider.beginAuthorization(scopes: Scope.defaults, mode: .handoff)
+        return (provider, http, start, Fixtures.query(of: start.interaction.verificationURL))
+    }
+
+    @Test("A hand-off flow sends the registered redirect URI and returns at once")
+    func handoffStart() async throws {
+        let (provider, http, start, sent) = try await startHandoff()
+
+        #expect(start.interaction.mode == .handoff)
+        #expect(start.interaction.redirectURI == Fixtures.handoffRedirectURI)
+        #expect(start.interaction.userCode == nil)
+        #expect(start.interaction.verificationURL.path == "/authorize")
+        #expect(sent["redirect_uri"] == "myapp://callback")
+        #expect(sent["response_type"] == "code")
+        #expect(sent["client_id"] == "test-client")
+        #expect(sent["code_challenge_method"] == "S256")
+        #expect(sent["state"]?.isEmpty == false)
+        #expect(sent["code_challenge"]?.isEmpty == false)
+
+        // Waiting cannot make a redirect arrive, so the call must not hold the
+        // caller for `timeout` the way a device poll does.
+        let clock = ContinuousClock()
+        let began = clock.now
+        let outcome = try await provider.awaitAuthorization(handle: start.handle, timeout: 30)
+        guard case .pending = outcome else {
+            Issue.record("expected pending, got \(outcome)")
+            return
+        }
+        #expect(clock.now - began < .seconds(2))
+        #expect(http.requests(toPath: "/token").isEmpty)
+    }
+
+    @Test("A captured redirect is exchanged with the PKCE verifier, exactly once")
+    func handoffCompletes() async throws {
+        let (provider, http, start, sent) = try await startHandoff()
+        let state = try #require(sent["state"])
+        let redirect = try #require(URL(string: "myapp://callback?code=CODE-1&state=\(state)"))
+
+        let outcome = try await provider.completeAuthorization(
+            handle: start.handle, redirectURL: redirect)
+
+        guard case .completed(let tokens) = outcome else {
+            Issue.record("expected completion, got \(outcome)")
+            return
+        }
+        #expect(tokens.accessToken == "handoff-token")
+
+        let request = try #require(http.requests(toPath: "/token").first)
+        #expect(request.form["grant_type"] == "authorization_code")
+        #expect(request.form["code"] == "CODE-1")
+        #expect(request.form["redirect_uri"] == "myapp://callback")
+        #expect(request.form["resource"] == "https://api.example.com")
+        // The verifier sent to the token endpoint must be the one whose challenge
+        // went to the authorization endpoint — that pairing is the whole of PKCE.
+        let verifier = try #require(request.form["code_verifier"])
+        #expect(try PKCE.makeChallenge(from: verifier) == sent["code_challenge"])
+
+        // Single use: the same redirect replayed finds no flow.
+        #expect(await provider.pendingFlowCount == 0)
+        await #expect(throws: OAuthError.unknownFlow(handle: start.handle)) {
+            try await provider.completeAuthorization(handle: start.handle, redirectURL: redirect)
+        }
+        #expect(http.requests(toPath: "/token").count == 1)
+    }
+
+    @Test(
+        "A URL that is not the registered redirect is refused and the flow survives",
+        arguments: [
+            "https://as.example.com/authorize?state=x",
+            "myapp://other?code=c&state=s",
+            "myapp://callback/extra?code=c&state=s",
+            "otherapp://callback?code=c&state=s",
+            "myapp://user@callback?code=c&state=s",
+        ])
+    func handoffRejectsForeignRedirect(_ raw: String) async throws {
+        let (provider, http, start, sent) = try await startHandoff()
+        let foreign = try #require(URL(string: raw))
+
+        await #expect(throws: OAuthError.self) {
+            try await provider.completeAuthorization(handle: start.handle, redirectURL: foreign)
+        }
+        #expect(http.requests(toPath: "/token").isEmpty)
+
+        // The mistake cost nothing: the right redirect still completes the flow.
+        // Scheme and host differ only in case, which must not matter.
+        let state = try #require(sent["state"])
+        let genuine = try #require(URL(string: "MyApp://CALLBACK?code=c&state=\(state)"))
+        let outcome = try await provider.completeAuthorization(
+            handle: start.handle, redirectURL: genuine)
+        guard case .completed = outcome else {
+            Issue.record("expected completion, got \(outcome)")
+            return
+        }
+    }
+
+    @Test("A redirect with the wrong state never reaches the token endpoint")
+    func handoffRejectsWrongState() async throws {
+        let (provider, http, start, _) = try await startHandoff()
+        let forged = try #require(URL(string: "myapp://callback?code=stolen&state=forged"))
+
+        await #expect(throws: OAuthError.stateMismatch) {
+            try await provider.completeAuthorization(handle: start.handle, redirectURL: forged)
+        }
+        #expect(http.requests(toPath: "/token").isEmpty)
+        // Fail closed: a redirect that failed its CSRF check spends the flow.
+        #expect(await provider.pendingFlowCount == 0)
+    }
+
+    @Test("A redirect reporting access_denied is a denial, not a crash")
+    func handoffDenied() async throws {
+        let (provider, http, start, sent) = try await startHandoff()
+        let state = try #require(sent["state"])
+        let refusal = try #require(
+            URL(string: "myapp://callback?error=access_denied&error_description=no&state=\(state)"))
+
+        let outcome = try await provider.completeAuthorization(
+            handle: start.handle, redirectURL: refusal)
+
+        guard case .denied(let reason) = outcome else {
+            Issue.record("expected denial, got \(outcome)")
+            return
+        }
+        #expect(reason == "no")
+        #expect(http.requests(toPath: "/token").isEmpty)
+    }
+
+    @Test("A token endpoint that refuses the code fails the sign-in and spends the flow")
+    func handoffExchangeRejected() async throws {
+        let (provider, _, start, sent) = try await startHandoff(
+            tokenReplies: [.oauthError("invalid_grant", description: "code already used")])
+        let state = try #require(sent["state"])
+        let redirect = try #require(URL(string: "myapp://callback?code=c&state=\(state)"))
+
+        await #expect(
+            throws: OAuthError.serverRejected(code: "invalid_grant", description: "code already used")
+        ) {
+            try await provider.completeAuthorization(handle: start.handle, redirectURL: redirect)
+        }
+        #expect(await provider.pendingFlowCount == 0)
+    }
+
+    @Test("Hand-off is refused when no redirect URI is configured")
+    func handoffNeedsConfiguration() async throws {
+        let http = Fixtures.deviceFlowClient(pollReplies: [Fixtures.tokenResponse()])
+        let provider = try makeProvider(http: http)
+
+        await #expect(throws: OAuthError.self) {
+            try await provider.beginAuthorization(scopes: Scope.defaults, mode: .handoff)
+        }
+        #expect(await provider.pendingFlowCount == 0)
+    }
+
+    @Test("automatic never picks hand-off, even when it is configured")
+    func automaticNeverPicksHandoff() async throws {
+        let http = Fixtures.deviceFlowClient(pollReplies: [Fixtures.tokenResponse()])
+        let provider = try makeProvider(
+            http: http,
+            configuration: Fixtures.oauthConfiguration(
+                handoffRedirectURI: Fixtures.handoffRedirectURI))
+
+        let start = try await provider.beginAuthorization(scopes: Scope.defaults, mode: .automatic)
+        #expect(start.interaction.mode == .device)
+    }
+
+    @Test("A redirect sent to a device flow is refused without disturbing it")
+    func redirectToDeviceFlowRefused() async throws {
+        let http = Fixtures.deviceFlowClient(pollReplies: [Fixtures.tokenResponse()])
+        let provider = try makeProvider(http: http)
+        let start = try await provider.beginAuthorization(scopes: Scope.defaults, mode: .device)
+        let redirect = try #require(URL(string: "myapp://callback?code=c&state=s"))
+
+        await #expect(throws: OAuthError.self) {
+            try await provider.completeAuthorization(handle: start.handle, redirectURL: redirect)
+        }
+        #expect(await provider.pendingFlowCount == 1)
+        #expect(http.requests(toPath: "/token").isEmpty)
+    }
+
+    @Test(
+        "A hand-off redirect URI that could never match is refused at startup",
+        arguments: ["callback", "myapp://callback#fragment"])
+    func rejectsUnusableHandoffRedirect(_ raw: String) throws {
+        let redirect = try #require(URL(string: raw))
+        let configuration = Fixtures.oauthConfiguration(handoffRedirectURI: redirect)
+        #expect(throws: OAuthError.self) { try configuration.validate() }
     }
 
     // MARK: - Refresh

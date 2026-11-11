@@ -10,8 +10,16 @@ public enum AuthorizationMode: String, Sendable, Codable, CaseIterable {
     /// RFC 8252 authorization code with PKCE over a loopback redirect. The server
     /// opens the local browser and catches the redirect on 127.0.0.1.
     case browser
+    /// Authorization code with PKCE where the *client* catches the redirect and
+    /// hands it back. For a client registration whose redirect URI is fixed and
+    /// not ours to receive — a custom scheme such as `myapp://callback` — the
+    /// server cannot listen for it, so whatever drives the user's browser
+    /// captures the redirect and returns it through
+    /// ``AuthorizationProvider/completeAuthorization(handle:redirectURL:)``.
+    case handoff
     /// Pick the best mode: `browser` when the server shares a machine with the
-    /// user (stdio transport) and the AS supports it, `device` otherwise.
+    /// user (stdio transport) and the AS supports it, `device` otherwise. Never
+    /// picks `handoff`, which only works when the caller can capture a redirect.
     case automatic
 }
 
@@ -25,6 +33,10 @@ public struct UserInteraction: Sendable, Equatable, Codable {
     public let verificationURLComplete: URL?
     /// Device flow only: the short code the user types.
     public let userCode: String?
+    /// Hand-off flow only: the redirect URI the authorization server will send
+    /// the browser to. The client watches for a navigation to it and returns the
+    /// full URL it saw.
+    public let redirectURI: URL?
     /// When this authorization request stops being accepted.
     public let expiresAt: Date
     /// A sentence to show the user, ready to be surfaced verbatim by a client.
@@ -35,6 +47,7 @@ public struct UserInteraction: Sendable, Equatable, Codable {
         verificationURL: URL,
         verificationURLComplete: URL? = nil,
         userCode: String? = nil,
+        redirectURI: URL? = nil,
         expiresAt: Date,
         instructions: String
     ) {
@@ -42,6 +55,7 @@ public struct UserInteraction: Sendable, Equatable, Codable {
         self.verificationURL = verificationURL
         self.verificationURLComplete = verificationURLComplete
         self.userCode = userCode
+        self.redirectURI = redirectURI
         self.expiresAt = expiresAt
         self.instructions = instructions
     }
@@ -130,6 +144,20 @@ public protocol AuthorizationProvider: Sendable {
         timeout: TimeInterval
     ) async throws -> AuthorizationOutcome
 
+    /// Finishes a `handoff` authorization with the redirect the client captured.
+    ///
+    /// The URL arrives through the model's context, so it is treated as
+    /// untrusted: it must match the flow's redirect URI and carry the flow's
+    /// `state` before its code goes anywhere near the token endpoint.
+    ///
+    /// - Throws: ``OAuthError/redirectRejected(reason:)`` when the URL is not a
+    ///   redirect for this flow at all; the flow stays alive so the caller can
+    ///   send the right one.
+    func completeAuthorization(
+        handle: String,
+        redirectURL: URL
+    ) async throws -> AuthorizationOutcome
+
     /// Abandons a started authorization and releases its resources.
     func cancelAuthorization(handle: String) async
 
@@ -139,4 +167,15 @@ public protocol AuthorizationProvider: Sendable {
     /// Revokes both tokens at the authorization server. Never throws: the caller
     /// must be able to destroy the local session regardless of the outcome.
     func revoke(_ tokens: TokenSet) async -> RevocationReport
+}
+
+extension AuthorizationProvider {
+    /// Providers that never start a `handoff` flow have nothing to complete.
+    public func completeAuthorization(
+        handle: String,
+        redirectURL: URL
+    ) async throws -> AuthorizationOutcome {
+        throw OAuthError.redirectRejected(
+            reason: "this provider does not accept a client-captured redirect")
+    }
 }
